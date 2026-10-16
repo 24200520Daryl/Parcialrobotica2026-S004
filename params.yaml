@@ -1,0 +1,25 @@
+# NO poner claves aqui. La clave de Google va SOLO en variables de entorno.
+interprete_ordenes:
+  ros__parameters:
+    laya_host: "172.51.1.8"        # servidor LAYA (PC del laboratorio)
+    laya_puerto: 8000
+    laya_endpoint: "/v1/systemone"
+    laya_modelo: "multilingual"    # español
+    laya_preset: ""                # solo si el docente lo indica
+    timeout_s: 2.0                 # recuerda: el argumento del launch pisa este valor
+    enfriamiento_laya_s: 0.0
+    umbral_prohibida: 0.5
+    colores: ["rojo", "verde", "azul", "amarillo"]
+    objetos: ["cubo", "esfera", "cilindro", "pelota"]   # las formas extra hacen que "toma la esfera azul" se rechace como objeto ausente
+    zonas: ["A", "B", "C"]         # iguales a mesa_zonas del broker
+
+transcriptor_voz:
+  ros__parameters:
+    fuente: "microfono"            # microfono | archivo | teclado
+    origen: "integrante_1"
+    modelo_gemini: "gemini-flash-latest"   # verifica el nombre vigente en AI Studio
+    timeout_stt_s: 6.0
+    enfriamiento_nube_s: 30.0
+    silencio_fin_s: 0.8
+
+# El broker es el de RB-2 (arm_broker): sus parametros estan en arm_broker_gran_reto.yaml
