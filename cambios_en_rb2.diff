@@ -1,0 +1,602 @@
+diff -ruN '--exclude=__pycache__' original/arm_broker/arm_broker/broker_node.py nuevo/arm_broker/arm_broker/broker_node.py
+--- original/arm_broker/arm_broker/broker_node.py	2026-10-12 04:37:01.160557883 +0000
++++ nuevo/arm_broker/arm_broker/broker_node.py	2026-10-12 04:38:48.114473975 +0000
+@@ -18,10 +18,12 @@
+ from sensor_msgs.msg import JointState
+ from std_msgs.msg import String
+ 
+-from arm_broker_interfaces.action import MoveJoints
++from arm_broker_interfaces.action import MoveJoints, PickPlace
+ from arm_broker_interfaces.msg import QueueState
+ 
+ from .admission import Limits, validate
++from .kinematics import fk
++from .pick_place import Mesa, PlanificadorPick, validar_orden
+ from .policies import Entry, Scheduler
+ 
+ RATE = 20.0  # Hz de /joint_states durante un movimiento
+@@ -52,6 +54,7 @@
+         self._log('goals_log.csv', ['seq', 'client_id', 'priority', 't_enq_wall', 'espera_s',
+                                     'duracion_s', 'resultado'], 'w')
+ 
++        self._init_pick(p)                                   # <<< Gran Reto (aditivo)
+         accept_grp, worker_grp = ReentrantCallbackGroup(), MutuallyExclusiveCallbackGroup()
+         self._js_pub = self.create_publisher(JointState, '/joint_states', 10)  # UNICO publicador
+         self._qs_pub = self.create_publisher(QueueState, '/arm/queue_state', 10)
+@@ -59,6 +62,10 @@
+         ActionServer(self, MoveJoints, '/arm/move_joints', execute_callback=self._await_result,
+                      goal_callback=self._goal_cb, handle_accepted_callback=self._accepted_cb,
+                      cancel_callback=lambda gh: CancelResponse.ACCEPT, callback_group=accept_grp)
++        # >>> Gran Reto: 2.a accion sobre la MISMA cola, el MISMO worker y el MISMO portero <<<
++        ActionServer(self, PickPlace, '/arm/pick_place', execute_callback=self._await_result_pick,
++                     goal_callback=self._goal_cb_pick, handle_accepted_callback=self._accepted_pick_cb,
++                     cancel_callback=lambda gh: CancelResponse.ACCEPT, callback_group=accept_grp)
+         self.create_timer(0.05, self._worker_tick, callback_group=worker_grp)
+         self.create_timer(0.2, self._publish_queue_state, callback_group=accept_grp)  # 5 Hz
+         self.get_logger().info(f'arm_broker listo | politica={self._sched.policy} | accion=/arm/move_joints')
+@@ -104,6 +111,8 @@
+         e.gh.execute()  # dispara _await_result, que solo espera el resultado
+         if e.gh.is_cancel_requested:
+             e.outcome, e.message = 'canceled', 'cancelado antes de ejecutarse'
++        elif e.kind == 'pick':                      # Gran Reto
++            e.outcome, e.message = self._run_pick_seguro(e)
+         else:
+             e.outcome, e.message = self._move_to(e)
+         e.final_q = [float(x) for x in self._cur_q]
+@@ -154,6 +163,180 @@
+         res.message, res.final_q = e.message, e.final_q
+         return res
+ 
++    # ======================= GRAN RETO: recoger y colocar (aditivo) =======================
++    def _init_pick(self, p):
++        for k, v in dict(
++                mesa_objetos=['rojo:cubo:200:100:20', 'verde:cilindro:200:-100:20',
++                              'azul:esfera:230:0:20', 'amarillo:prisma:150:150:20'],
++                mesa_zonas=['A:100:-200:30', 'B:0:-220:30', 'C:-100:-200:30'],
++                pose_inicio=[0.0, -0.5, 0.5, 0.0, 0.5, 0.0],
++                q_agarre_ref=[0.0, -0.5, 0.5, 0.0, 0.5, 0.0],   # CALIBRAR (ver README)
++                eje_aproximacion=0, mantener_orientacion=True,
++                z_aprox_mm=60.0, dz_agarre_mm=0.0, dz_dejar_mm=10.0,
++                habilitar_gripper=False).items():
++            self.declare_parameter(k, v)
++        self._mesa = Mesa.desde_params(list(p('mesa_objetos')), list(p('mesa_zonas')))
++        self._plan = PlanificadorPick(
++            self._mesa, self._lim, p('pose_inicio'), p('q_agarre_ref'),
++            mantener_orientacion=bool(p('mantener_orientacion')),
++            eje_aproximacion=int(p('eje_aproximacion')), z_aprox_mm=p('z_aprox_mm'),
++            dz_agarre_mm=p('dz_agarre_mm'), dz_dejar_mm=p('dz_dejar_mm'))
++        self._q_inicio = np.array(p('pose_inicio'), float)
++        self._log('desglose_tiempos.csv',
++                  ['seq', 'client_id', 'frase', 'accion', 'color', 'zona', 'prioridad', 'fuente',
++                   'resultado', 'captura_ms', 'transcripcion_ms', 'decision_ms', 'espera_cola_ms',
++                   'percepcion_ms', 'ik_ms', 'plan_ms', 'voz_a_movimiento_ms', 'ejecucion_s',
++                   'error_fk_mm', 'error_fk_fuente'], 'w')
++        for aviso in self._plan.diagnostico_alcance():
++            self.get_logger().warn(f'ALCANCE: {aviso}  (revisa mesa_* y q_agarre_ref)')
++        self.get_logger().info(
++            f"Gran Reto listo: accion=/arm/pick_place | objetos={list(self._mesa.objetos)} | "
++            f"zonas={list(self._mesa.zonas)} | q_agarre_ref={list(p('q_agarre_ref'))}")
++
++    # ---- portero (mismo goal_callback del RB-2: rechaza ANTES de encolar) ----
++    def _goal_cb_pick(self, req):
++        with self._lock:
++            full = len(self._sched) >= self._max_queue
++        if not req.client_id:
++            return self._reject(req, 'NO_CLIENT', 'client_id vacio')
++        if full:
++            return self._reject(req, 'QUEUE_FULL', f'cola llena ({self._max_queue})')
++        ok, code, msg, _ = validar_orden(req, self._mesa)
++        # el motivo lleva la frase para que el cliente pueda emparejar su rechazo
++        return GoalResponse.ACCEPT if ok else self._reject(req, code, f"'{req.frase}' -> {msg}")
++
++    def _accepted_pick_cb(self, gh):            # SOLO encola, igual que _accepted_cb
++        r = gh.request
++        with self._lock:
++            self._seq += 1
++            e = Entry(self._seq, r.client_id, min(int(r.priority), 2), time.monotonic(), [],
++                      t_wall=time.time(), gh=gh, kind='pick', orden=r)
++            self._by_uuid[bytes(gh.goal_id.uuid)] = e
++            self._sched.push(e)
++            self._n_acc += 1
++        self.get_logger().info(f"encolado #{e.seq} [{e.client_id}] prio={e.priority} "
++                               f"PICK '{r.frase}' ({r.fuente})")
++
++    # ---- worker: ejecuta la orden (percepcion -> IK -> trayectoria -> gripper) ----
++    def _run_pick(self, e):
++        o, t = e.orden, {}
++        t['espera_cola_ms'] = (e.t_start - e.t_enq) * 1000.0
++        self._fb(e, 'PERCEIVING', 0.0)
++        if o.accion == 'ir_inicio':
++            t.update(percepcion_ms=0.0, ik_ms=0.0, plan_ms=0.0)
++            pasos, destino, color = [('inicio', self._q_inicio.copy(), None)], None, ''
++        else:
++            _, _, _, color = validar_orden(o, self._mesa)
++            t0 = time.perf_counter()
++            pos = self._percibir(color, o.objeto)                      # TODO(RB-2): camara
++            t['percepcion_ms'] = (time.perf_counter() - t0) * 1000.0
++            if pos is None:
++                self._fila_desglose(e, t, 'fallo_percepcion', 0.0, -1.0, '')
++                return 'aborted', f"la camara no localiza el objeto '{color}'"
++            self._fb(e, 'PLANNING', 0.0)
++            plan = self._plan.planear(color, o.zona, self._cur_q, pos)   # IK + admision interna
++            t['ik_ms'], t['plan_ms'] = plan.ik_ms, plan.plan_ms
++            if not plan.ok:
++                self._fila_desglose(e, t, 'fallo_planificacion', 0.0, -1.0, '')
++                return 'aborted', plan.motivo
++            pasos, destino = plan.pasos, plan.destino_mm
++        t_ini = time.monotonic()
++        err, fuente = -1.0, ''
++        for i, (nombre, q, gripper) in enumerate(pasos):
++            res = self._segmento(e, q, 'EXECUTING', i / len(pasos))
++            if res:
++                self._fila_desglose(e, t, 'cancelada', time.monotonic() - t_ini, -1.0, '')
++                return 'canceled', 'cancelado durante la ejecucion'
++            if nombre == 'deposito' and destino is not None:
++                # error entre la posicion SOLICITADA y la ALCANZADA, con la FK del RB-2
++                q_real = self._leer_q_real()                            # TODO(RB-2): lectura real
++                fuente = 'real' if q_real is not None else 'comandado'
++                err = float(np.linalg.norm(
++                    fk(q_real if q_real is not None else q)[:3, 3] - np.array(destino)))
++            if gripper:
++                self._fb(e, 'GRIPPER', (i + 1) / len(pasos))
++                self._gripper(gripper)                                  # TODO(RB-2): gripper
++        with self._lock:                  # tras un pick, la referencia de "paso" es la pose real
++            if not any(x.kind == 'move' for x in self._sched.items):
++                self._ref_q = self._cur_q.copy()
++        e.extra['error_fk_mm'] = err
++        self._fila_desglose(e, t, 'ok', time.monotonic() - t_ini, err, fuente)
++        return 'succeeded', 'ok' if fuente != 'comandado' else 'ok (error FK sobre q comandado)'
++
++    def _run_pick_seguro(self, e):
++        try:
++            return self._run_pick(e)
++        except Exception as ex:            # el cliente siempre recibe un resultado
++            self.get_logger().error(f'#{e.seq} fallo inesperado en pick: {ex!r}')
++            return 'aborted', f'error interno: {ex!r}'
++
++    def _segmento(self, e, q1, estado, progreso0):
++        """Interpola hasta q1 publicando por el UNICO punto de escritura. True si cancelado."""
++        q0, q1 = self._cur_q.copy(), np.array(q1, float)
++        n = max(int(np.abs(q1 - q0).max() / self._vmax * RATE), 2)
++        for i in range(1, n + 1):
++            if e.gh.is_cancel_requested:
++                return True
++            self._publish_joint_state(q0 + (q1 - q0) * (0.5 - 0.5 * np.cos(np.pi * i / n)))
++            e.extra.setdefault('t_primer_mov', time.time())       # "el brazo inicia el movimiento"
++            self._fb(e, estado, progreso0)
++            time.sleep(1.0 / RATE)
++        return False
++
++    def _fb(self, e, estado, progreso):
++        e.gh.publish_feedback(PickPlace.Feedback(queue_position=0, state=estado, progress=float(progreso)))
++
++    # ---- ganchos hacia lo construido en los retos previos (reemplazar) ----
++    def _percibir(self, color, objeto):
++        """Camara: devolver (x, y, z) mm del objeto en el marco de la base, o None si no
++        lo ve. Por defecto: posicion conocida de la mesa (catalogo)."""
++        _, x, y, z = self._mesa.objetos[color]
++        return (x, y, z)
++
++    def _gripper(self, accion):
++        """accion: 'abrir' | 'cerrar'. Por defecto solo registra (no mueve nada)."""
++        self.get_logger().info(f'[GRIPPER] {accion} (gancho sin conectar: habilitar_gripper=false)')
++        time.sleep(0.5)
++
++    def _leer_q_real(self):
++        """Angulos REALES del brazo (rad) desde el driver; None si no hay lectura."""
++        return None
++
++    def _fila_desglose(self, e, t, resultado, ejecucion_s, err, fuente):
++        o = e.orden
++        v2m = -1.0
++        if o.t_fin_habla > 0 and 't_primer_mov' in e.extra:
++            v2m = (e.extra['t_primer_mov'] - o.t_fin_habla) * 1000.0
++        e.extra['voz_a_movimiento_ms'] = v2m
++        self._log('desglose_tiempos.csv', [
++            e.seq, e.client_id, o.frase, o.accion, o.color, o.zona, e.priority, o.fuente,
++            resultado, f'{o.captura_ms:.1f}', f'{o.transcripcion_ms:.1f}', f'{o.decision_ms:.1f}',
++            f"{t.get('espera_cola_ms', 0):.1f}", f"{t.get('percepcion_ms', 0):.1f}",
++            f"{t.get('ik_ms', 0):.1f}", f"{t.get('plan_ms', 0):.1f}", f'{v2m:.1f}',
++            f'{ejecucion_s:.2f}', f'{err:.2f}', fuente])
++
++    def _await_result_pick(self, gh):
++        """execute_callback de PickPlace: espera al worker y cierra el goal."""
++        e = self._by_uuid.pop(bytes(gh.goal_id.uuid), None)
++        res = PickPlace.Result()
++        if e is None:
++            gh.abort()
++            res.message = 'error interno'
++            return res
++        while not e.done.wait(0.1) and rclpy.ok():
++            pass
++        if gh.is_cancel_requested:
++            gh.canceled()
++        elif e.outcome == 'succeeded':
++            gh.succeed()
++        else:
++            gh.abort()
++        res.success = e.outcome == 'succeeded' and not gh.is_cancel_requested
++        res.message, res.final_q = e.message, e.final_q
++        res.error_fk_mm = float(e.extra.get('error_fk_mm', -1.0))
++        res.voz_a_movimiento_ms = float(e.extra.get('voz_a_movimiento_ms', -1.0))
++        return res
++
+     # ---- /arm/queue_state (5 Hz) ----
+     def _publish_queue_state(self):
+         now = time.monotonic()
+diff -ruN '--exclude=__pycache__' original/arm_broker/arm_broker/ik.py nuevo/arm_broker/arm_broker/ik.py
+--- original/arm_broker/arm_broker/ik.py	1970-01-01 00:00:00.000000000 +0000
++++ nuevo/arm_broker/arm_broker/ik.py	2026-10-12 04:38:04.776153578 +0000
+@@ -0,0 +1,80 @@
++"""Cinematica inversa NUMERICA sobre la FK del RB-2 (kinematics.fk). Sin ROS.
++
++Minimos cuadrados amortiguados (DLS) con Jacobiano por diferencias finitas:
++    dq = J^T (J J^T + lambda^2 I)^-1 e
++Resuelve posicion (mm) y, opcionalmente, ALINEA el eje de aproximacion del efector
++con una direccion `a_ref` (p. ej. hacia la mesa). El giro alrededor de ese eje queda
++LIBRE: para agarrar basta que el gripper apunte hacia abajo; exigir tambien el
++mismo giro en todos los puntos haria inalcanzable media mesa.
++Parte de una semilla, asi que devuelve la solucion de codo mas cercana a la
++configuracion actual (menor movimiento articular).
++"""
++import math
++from dataclasses import dataclass
++from typing import Optional, Sequence
++
++import numpy as np
++
++from .kinematics import fk
++
++
++@dataclass
++class ResultadoIK:
++    q: np.ndarray
++    ok: bool
++    err_pos_mm: float
++    err_rot_rad: float
++    iteraciones: int
++
++
++def _residuo(q, p, a_ref, eje, w_rot):
++    T = fk(q)
++    e = [p - T[:3, 3]]
++    if a_ref is not None:
++        # cross(a_actual, a_ref) = 0 cuando el eje de aproximacion apunta a a_ref
++        e.append(np.cross(T[:3, eje], a_ref) * w_rot)    # w_rot: mm por rad
++    return np.concatenate(e), T
++
++
++def resolver(p_mm: Sequence[float], q_semilla: Sequence[float], q_min, q_max,
++             a_ref: Optional[Sequence[float]] = None, eje: int = 0, w_rot: float = 80.0,
++             tol_pos: float = 0.5, tol_rot: float = 0.03, max_iter: int = 200,
++             lam: float = 0.05, paso_max: float = 0.3) -> ResultadoIK:
++    p = np.asarray(p_mm, float)
++    a_ref = None if a_ref is None else np.asarray(a_ref, float) / np.linalg.norm(a_ref)
++    q = np.clip(np.asarray(q_semilla, float), q_min, q_max)
++    n = 0
++    for n in range(1, max_iter + 1):
++        e, _ = _residuo(q, p, a_ref, eje, w_rot)
++        ep = float(np.linalg.norm(e[:3]))
++        er = float(np.linalg.norm(e[3:])) / w_rot if a_ref is not None else 0.0
++        if ep <= tol_pos and er <= tol_rot:
++            return ResultadoIK(q, True, ep, er, n)
++        J = np.zeros((len(e), 6))
++        h = 1e-6
++        for i in range(6):
++            dq = q.copy()
++            dq[i] += h
++            J[:, i] = (e - _residuo(dq, p, a_ref, eje, w_rot)[0]) / h   # d(e)/dq = -dF/dq
++        paso = J.T @ np.linalg.solve(J @ J.T + lam ** 2 * np.eye(len(e)), e)
++        m = float(np.abs(paso).max())
++        if m > paso_max:
++            paso *= paso_max / m
++        q = np.clip(q + paso, q_min, q_max)
++    e, _ = _residuo(q, p, a_ref, eje, w_rot)
++    ep = float(np.linalg.norm(e[:3]))
++    er = float(np.linalg.norm(e[3:])) / w_rot if a_ref is not None else 0.0
++    return ResultadoIK(q, ep <= tol_pos and er <= tol_rot, ep, er, n)
++
++
++def resolver_multi(p_mm, semillas, q_min, q_max, **kw) -> ResultadoIK:
++    """Prueba varias semillas en orden; devuelve la primera que converge
++    (o la de menor error si ninguna converge)."""
++    mejor = None
++    for s in semillas:
++        r = resolver(p_mm, s, q_min, q_max, **kw)
++        if r.ok:
++            return r
++        if mejor is None or r.err_pos_mm < mejor.err_pos_mm:
++            mejor = r
++    return mejor
+diff -ruN '--exclude=__pycache__' original/arm_broker/arm_broker/pick_place.py nuevo/arm_broker/arm_broker/pick_place.py
+--- original/arm_broker/arm_broker/pick_place.py	1970-01-01 00:00:00.000000000 +0000
++++ nuevo/arm_broker/arm_broker/pick_place.py	2026-10-12 04:38:04.776512415 +0000
+@@ -0,0 +1,156 @@
++"""Logica de la orden 'recoger y colocar' (Gran Reto). Python puro, sin ROS.
++
++ validar_orden()      -> admision de la decision tipada (usa el MISMO portero del RB-2:
++                         se llama desde el goal_callback, antes de encolar)
++ PlanificadorPick     -> convierte (objeto, zona) en una secuencia de waypoints
++                         articulares usando la IK sobre la FK del RB-2
++Unidades: milimetros (igual que kinematics.fk) y radianes.
++"""
++import time
++from dataclasses import dataclass, field, replace
++from typing import Dict, List, Optional, Tuple
++
++import numpy as np
++
++from . import ik
++from .admission import Limits, validate
++from .kinematics import fk
++
++ACCION_RECOGER = 'recoger_y_colocar'
++ACCION_INICIO = 'ir_inicio'
++NINGUNO = 'ninguno'
++
++
++@dataclass
++class Mesa:
++    objetos: Dict[str, Tuple[str, float, float, float]]   # color -> (objeto, x, y, z)
++    zonas: Dict[str, Tuple[float, float, float]]          # zona  -> (x, y, z)
++
++    @staticmethod
++    def desde_params(objetos: List[str], zonas: List[str]) -> 'Mesa':
++        """'color:objeto:x:y:z' (mm) y 'zona:x:y:z' (mm), en el marco de la base."""
++        obj = {}
++        for s in objetos:
++            c, o, x, y, z = s.split(':')
++            obj[c] = (o, float(x), float(y), float(z))
++        zon = {}
++        for s in zonas:
++            n, x, y, z = s.split(':')
++            zon[n] = (float(x), float(y), float(z))
++        return Mesa(obj, zon)
++
++    def resolver_objeto(self, color: str, objeto: str):
++        """-> (ok, codigo, motivo, color_resuelto)."""
++        if color != NINGUNO:
++            if color not in self.objetos:
++                return False, 'OBJETO_AUSENTE', f"no hay ningun objeto de color '{color}' sobre la mesa", ''
++            if objeto not in (NINGUNO, self.objetos[color][0]):
++                return (False, 'OBJETO_AUSENTE',
++                        f"no hay '{objeto}' de color '{color}' (el de ese color es "
++                        f"'{self.objetos[color][0]}')", '')
++            return True, 'OK', '', color
++        if objeto == NINGUNO:
++            return False, 'OBJETO_NO_INDICADO', 'la orden no indica que objeto recoger', ''
++        cand = [c for c, v in self.objetos.items() if v[0] == objeto]
++        if len(cand) != 1:
++            return (False, 'OBJETO_AUSENTE' if not cand else 'OBJETO_AMBIGUO',
++                    f"objeto '{objeto}' " + ('ausente de la mesa' if not cand
++                                             else 'ambiguo: indica el color'), '')
++        return True, 'OK', '', cand[0]
++
++
++def validar_orden(o, mesa: Mesa):
++    """Admision de la decision tipada. `o` tiene accion/objeto/color/zona/permitido/
++    causa_decision. Devuelve (ok, codigo, motivo, color_resuelto)."""
++    if not o.permitido:                                    # <<< regla del examen
++        return (False, 'NO_PERMITIDO',
++                f"orden no permitida ({o.causa_decision or 'sin detalle'})", '')
++    if o.accion == ACCION_INICIO:
++        return True, 'OK', '', ''
++    if o.accion != ACCION_RECOGER:
++        return False, 'ACCION_DESCONOCIDA', f"accion no reconocida: '{o.accion}'", ''
++    ok, code, msg, color = mesa.resolver_objeto(o.color, o.objeto)
++    if not ok:
++        return False, code, msg, ''
++    if o.zona not in mesa.zonas:
++        return False, 'ZONA_INVALIDA', f"zona de destino invalida o no indicada: '{o.zona}'", ''
++    return True, 'OK', '', color
++
++
++@dataclass
++class Plan:
++    ok: bool
++    motivo: str = ''
++    pasos: list = field(default_factory=list)   # (nombre, q[6], gripper_despues)
++    destino_mm: Optional[Tuple[float, float, float]] = None
++    ik_ms: float = 0.0
++    plan_ms: float = 0.0
++
++
++class PlanificadorPick:
++    def __init__(self, mesa: Mesa, lim: Limits, q_inicio, q_agarre_ref,
++                 mantener_orientacion=True, eje_aproximacion=0, z_aprox_mm=60.0,
++                 dz_agarre_mm=0.0, dz_dejar_mm=10.0):
++        self.mesa, self.q_inicio = mesa, np.asarray(q_inicio, float)
++        self.q_ref = np.asarray(q_agarre_ref, float)
++        # los limites de PASO no aplican a trayectorias internas del worker
++        self.lim = replace(lim, max_step=1e9)
++        # direccion de aproximacion = la que tiene el efector en la pose de agarre ensenada
++        self.eje = int(eje_aproximacion)
++        self.a_ref = fk(self.q_ref)[:3, self.eje] if mantener_orientacion else None
++        self.z_aprox, self.dz_agarre, self.dz_dejar = z_aprox_mm, dz_agarre_mm, dz_dejar_mm
++
++    def _ik(self, p, semillas):
++        return ik.resolver_multi(p, semillas, self.lim.q_min, self.lim.q_max,
++                                 a_ref=self.a_ref, eje=self.eje)
++
++    def planear(self, color: str, zona: str, q_actual, pos_objeto=None) -> Plan:
++        """pos_objeto: (x,y,z) mm de la camara; si es None se usa el catalogo."""
++        t0 = time.perf_counter()
++        _, ox, oy, oz = self.mesa.objetos[color]
++        if pos_objeto is not None:
++            ox, oy, oz = pos_objeto
++        zx, zy, zz = self.mesa.zonas[zona]
++        agarre = np.array([ox, oy, oz + self.dz_agarre])
++        dejar = np.array([zx, zy, zz + self.dz_dejar])
++        up = np.array([0.0, 0.0, self.z_aprox])
++        objetivos = [('aproximacion_objeto', agarre + up, 'abrir'),
++                     ('agarre', agarre, 'cerrar'),
++                     ('elevacion', agarre + up, None),
++                     ('aproximacion_zona', dejar + up, None),
++                     ('deposito', dejar, 'abrir'),
++                     ('retirada', dejar + up, None)]
++        pasos, q_prev, t_ik = [], np.asarray(q_actual, float), 0.0
++        for nombre, p, grip in objetivos:
++            t1 = time.perf_counter()
++            r = self._ik(p, [q_prev, self.q_ref, self.q_inicio])
++            t_ik += (time.perf_counter() - t1) * 1000.0
++            if not r.ok:
++                return Plan(False, f"IK sin solucion en '{nombre}' ({p[0]:.0f},{p[1]:.0f},"
++                                   f"{p[2]:.0f}) mm: error {r.err_pos_mm:.1f} mm / "
++                                   f"{r.err_rot_rad:.2f} rad", ik_ms=t_ik)
++            ok, code, msg = validate(r.q, r.q, self.lim)       # limites articulares + workspace
++            if not ok:
++                return Plan(False, f"'{nombre}' no es admisible: {code} {msg}", ik_ms=t_ik)
++            pasos.append((nombre, r.q, grip))
++            q_prev = r.q
++        pasos.append(('inicio', self.q_inicio.copy(), None))
++        total = (time.perf_counter() - t0) * 1000.0
++        return Plan(True, '', pasos, (float(dejar[0]), float(dejar[1]), float(dejar[2])),
++                    ik_ms=t_ik, plan_ms=max(total - t_ik, 0.0))
++
++    def diagnostico_alcance(self) -> List[str]:
++        """Avisos al arrancar: que objetos/zonas no se pueden alcanzar con la orientacion
++        de agarre configurada (calibra q_agarre_ref si salen todos)."""
++        avisos = []
++        for c in self.mesa.objetos:
++            for z in list(self.mesa.zonas)[:1]:
++                p = self.planear(c, z, self.q_ref)
++                if not p.ok:
++                    avisos.append(f"objeto '{c}': {p.motivo}")
++        for z in self.mesa.zonas:
++            c = next(iter(self.mesa.objetos))
++            p = self.planear(c, z, self.q_ref)
++            if not p.ok and f"zona '{z}'" not in ' '.join(avisos):
++                avisos.append(f"zona '{z}': {p.motivo}")
++        return avisos
+diff -ruN '--exclude=__pycache__' original/arm_broker/arm_broker/policies.py nuevo/arm_broker/arm_broker/policies.py
+--- original/arm_broker/arm_broker/policies.py	2026-10-12 04:37:01.160531680 +0000
++++ nuevo/arm_broker/arm_broker/policies.py	2026-10-12 04:37:01.176044189 +0000
+@@ -18,6 +18,9 @@
+     outcome: str = ''
+     message: str = ''
+     final_q: list = field(default_factory=list)
++    kind: str = 'move'           # 'move' (MoveJoints) | 'pick' (PickPlace, Gran Reto)
++    orden: Any = None            # decision tipada cuando kind == 'pick'
++    extra: dict = field(default_factory=dict)   # tiempos por etapa (Parte C)
+ 
+ 
+ class Scheduler:
+diff -ruN '--exclude=__pycache__' original/arm_broker/test/test_gran_reto.py nuevo/arm_broker/test/test_gran_reto.py
+--- original/arm_broker/test/test_gran_reto.py	1970-01-01 00:00:00.000000000 +0000
++++ nuevo/arm_broker/test/test_gran_reto.py	2026-10-12 04:40:04.795067882 +0000
+@@ -0,0 +1,71 @@
++"""Pruebas del Gran Reto (Python puro, sin ROS). Mismo estilo que test_logic.py."""
++import numpy as np
++from types import SimpleNamespace as NS
++
++from arm_broker import ik
++from arm_broker.admission import Limits
++from arm_broker.kinematics import fk
++from arm_broker.pick_place import Mesa, PlanificadorPick, validar_orden
++
++MESA = Mesa.desde_params(
++    ['rojo:cubo:200:100:20', 'verde:cilindro:200:-100:20', 'azul:esfera:230:0:20'],
++    ['A:100:-200:30', 'C:-100:-200:30'])
++
++
++def orden(**kw):
++    base = dict(accion='recoger_y_colocar', objeto='cubo', color='rojo', zona='A',
++                permitido=True, causa_decision='')
++    base.update(kw)
++    return NS(**base)
++
++
++def test_no_permitida_se_rechaza_con_causa():
++    ok, code, msg, _ = validar_orden(orden(permitido=False, causa_decision='tira'), MESA)
++    assert not ok and code == 'NO_PERMITIDO' and 'tira' in msg
++
++
++def test_objeto_ausente_ambiguo_y_zona():
++    assert validar_orden(orden(color='negro'), MESA)[1] == 'OBJETO_AUSENTE'
++    assert validar_orden(orden(color='rojo', objeto='esfera'), MESA)[1] == 'OBJETO_AUSENTE'
++    assert validar_orden(orden(color='ninguno', objeto='ninguno'), MESA)[1] == 'OBJETO_NO_INDICADO'
++    assert validar_orden(orden(zona='ninguno'), MESA)[1] == 'ZONA_INVALIDA'
++    assert validar_orden(orden(accion='desconocida'), MESA)[1] == 'ACCION_DESCONOCIDA'
++
++
++def test_resuelve_color_por_objeto_unico():
++    ok, _, _, color = validar_orden(orden(color='ninguno', objeto='esfera'), MESA)
++    assert ok and color == 'azul'
++
++
++def test_ik_ida_y_vuelta():
++    lim, rng = Limits(), np.random.default_rng(3)
++    bien = 0
++    for _ in range(30):
++        q = rng.uniform(lim.q_min * 0.6, lim.q_max * 0.6)
++        T = fk(q)
++        r = ik.resolver(T[:3, 3], q + rng.normal(0, 0.2, 6), lim.q_min, lim.q_max,
++                        a_ref=T[:3, 0], eje=0)
++        bien += r.ok and np.linalg.norm(fk(r.q)[:3, 3] - T[:3, 3]) < 1.0
++    assert bien >= 28
++
++
++def test_planificador_genera_secuencia_completa():
++    lim = Limits()
++    r = ik.resolver([200, 0, 60], [0, -0.5, 0.5, 0, 0.5, 0], lim.q_min, lim.q_max,
++                    a_ref=[0, 0, -1], eje=0)
++    pl = PlanificadorPick(MESA, lim, [0, -0.5, 0.5, 0, 0.5, 0], r.q, eje_aproximacion=0)
++    p = pl.planear('rojo', 'A', r.q)
++    assert p.ok
++    assert [n for n, _, _ in p.pasos] == ['aproximacion_objeto', 'agarre', 'elevacion',
++                                          'aproximacion_zona', 'deposito', 'retirada', 'inicio']
++    assert [g for _, _, g in p.pasos if g] == ['abrir', 'cerrar', 'abrir']
++    q_dep = dict((n, q) for n, q, _ in p.pasos)['deposito']
++    assert np.linalg.norm(fk(q_dep)[:3, 3] - np.array(p.destino_mm)) < 1.0
++
++
++def test_inalcanzable_se_informa():
++    lim = Limits()
++    mesa = Mesa.desde_params(['rojo:cubo:900:0:20'], ['A:100:-200:30'])
++    pl = PlanificadorPick(mesa, lim, [0, -0.5, 0.5, 0, 0.5, 0], [0, -0.5, 0.5, 0, 0.5, 0])
++    p = pl.planear('rojo', 'A', [0, -0.5, 0.5, 0, 0.5, 0])
++    assert not p.ok and 'aproximacion_objeto' in p.motivo
+diff -ruN original/arm_broker_interfaces/CMakeLists.txt nuevo/arm_broker_interfaces/CMakeLists.txt
+--- original/arm_broker_interfaces/CMakeLists.txt	2026-10-12 04:37:01.161305535 +0000
++++ nuevo/arm_broker_interfaces/CMakeLists.txt	2026-10-12 04:37:01.175943090 +0000
+@@ -5,6 +5,7 @@
+ find_package(builtin_interfaces REQUIRED)
+ rosidl_generate_interfaces(${PROJECT_NAME}
+   "action/MoveJoints.action"
++  "action/PickPlace.action"
+   "msg/QueueState.msg"
+   DEPENDENCIES builtin_interfaces
+ )
+diff -ruN original/arm_broker_interfaces/action/PickPlace.action nuevo/arm_broker_interfaces/action/PickPlace.action
+--- original/arm_broker_interfaces/action/PickPlace.action	1970-01-01 00:00:00.000000000 +0000
++++ nuevo/arm_broker_interfaces/action/PickPlace.action	2026-10-12 04:37:01.163058835 +0000
+@@ -0,0 +1,29 @@
++# Goal: decision TIPADA del interprete_ordenes. La prioridad la fija el MODELO.
++string client_id
++uint8 priority            # 0 = mas alta ... 2 = mas baja (igual que MoveJoints)
++string accion             # recoger_y_colocar | ir_inicio | desconocida
++string objeto
++string color
++string zona
++string frase
++bool permitido
++string causa_decision     # por que no es permitida (si permitido == false)
++bool degradado
++string fuente             # laya | palabras_clave
++# Marcas de tiempo / etapas previas (Parte C del examen)
++float64 t_fin_habla       # epoch s; 0.0 si la orden fue escrita
++float64 captura_ms
++float64 transcripcion_ms
++float64 decision_ms
++---
++# Result
++bool success
++string message
++float64[] final_q
++float64 error_fk_mm       # |FK(q alcanzado) - posicion solicitada| en el deposito
++float64 voz_a_movimiento_ms
++---
++# Feedback
++uint32 queue_position    # 0 = ejecutandose
++string state             # QUEUED | PERCEIVING | PLANNING | EXECUTING | GRIPPER
++float64 progress

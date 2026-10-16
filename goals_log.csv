@@ -1,0 +1,16 @@
+seq,client_id,priority,t_enq_wall,espera_s,duracion_s,resultado
+1,prueba1,1,1792086378.980,0.003,1.123,succeeded
+2,prueba1,1,1792086380.117,0.016,2.040,succeeded
+3,prueba1,1,1792086382.183,0.003,1.937,succeeded
+4,prueba1,1,1792086450.778,0.005,1.843,succeeded
+5,prueba1,1,1792086452.636,0.047,0.820,succeeded
+6,prueba1,1,1792086453.514,0.019,1.277,succeeded
+7,prueba1,1,1792086623.019,0.014,1.538,succeeded
+8,prueba1,1,1792086624.582,0.003,1.889,succeeded
+9,prueba1,1,1792086626.486,0.047,1.481,succeeded
+10,prueba1,1,1792086717.609,0.024,1.844,succeeded
+11,prueba1,1,1792086719.487,0.046,0.820,succeeded
+12,prueba1,1,1792086720.363,0.020,1.537,succeeded
+13,prueba1,1,1792086860.278,0.005,1.179,succeeded
+14,prueba1,1,1792086861.472,0.011,1.691,succeeded
+15,prueba1,1,1792086863.185,0.002,0.973,succeeded
